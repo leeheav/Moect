@@ -5,6 +5,10 @@ import shutil
 import threading
 import uuid
 import base64
+import time
+import re
+import tempfile
+import sqlite3
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -88,7 +92,7 @@ class Service:
         self._maintenance=False
         self._cache_readers=0
         self.config = {'theme':'light', 'accent':'violet', 'export_dir': str(Path.home()/'Documents'/APP_NAME/'exports'),
-                       'library': None, 'tasks': []}
+                       'library': None, 'tasks': [], 'auto_reconnect_on_startup': False, 'reuse_saved_keys': True}
         if self.config_path.exists():
             try:
                 saved = json.loads(self.config_path.read_text(encoding='utf-8'))
@@ -141,6 +145,8 @@ class Service:
         seen=self.config.get('asset_tutorials')
         self.config['asset_tutorials']={kind:bool(isinstance(seen,dict) and seen.get(kind) is True) for kind in ('moments','stickers')}
         self.config['app_onboarding_seen']=self.config.get('app_onboarding_seen') is True
+        self.config['auto_reconnect_on_startup']=self.config.get('auto_reconnect_on_startup') is True
+        self.config['reuse_saved_keys']=self.config.get('reuse_saved_keys', True) is not False
         # Capture before the frontend marks the tutorial as shown. The first
         # process must stay manual even after closing/reloading its tutorial.
         self._startup_reconnect_allowed = self.config['app_onboarding_seen']
@@ -208,6 +214,8 @@ class Service:
                     'session_sort':dict(self.config['session_sort']),
                     'accent':self.config['accent'],'accents':accent_choices(),'appearance':self.appearance(),
                     'export_dir':self.config['export_dir'],
+                    'auto_reconnect_on_startup':bool(self.config.get('auto_reconnect_on_startup', False)),
+                    'reuse_saved_keys':bool(self.config.get('reuse_saved_keys', True)),
                     'archive_options':public_options(self.config.get('archive_options')),
                     'storage_dir':str(self.storage_root),'storage_warning':self.storage_warning,'storage_busy':self._maintenance,
                     'library':dict(name=lib.get('profile',{}).get('name') or lib['name'],
@@ -357,6 +365,7 @@ class Service:
             if self._startup_reconnect_done:return self._startup_reconnect_result or {'skipped':True}
             self._startup_reconnect_done=True
             if not self._startup_reconnect_allowed:return {'skipped':True}
+            if not self.config.get('auto_reconnect_on_startup', False):return {'skipped':True}
             lib=self.library
             # A first installation, an imported backup, demo mode or an explicit
             # logout has no previously connected live account to refresh.
@@ -459,7 +468,17 @@ class Service:
             def key_progress(message):
                 check_connection()
             ex = key.KeyExtractor(account['db_storage'], progress=key_progress,cancel=check_connection)
-            ex.extract(save_to=str(keys_file))
+            reuse_keys = self.config.get('reuse_saved_keys', True)
+            cached_ok = False
+            if reuse_keys and keys_file.is_file():
+                try:
+                    cached_ok = bool(ex.load_cached(str(keys_file)))
+                except Exception:
+                    cached_ok = False
+            if not cached_ok:
+                ex.extract(save_to=str(keys_file))
+            else:
+                ex.save(str(keys_file))
             check_connection()
             keys = {k:v for k,v in key.load_keys(str(keys_file)).items() if not k.startswith('_')}
             if not keys:
@@ -530,12 +549,122 @@ class Service:
                 raise ValueError('分页参数无效')
             return archive.page(session, options_from(payload), before=before)
 
+    def sync_session(self, payload):
+        session_user = str((payload or {}).get('username') or '').strip()
+        if not session_user:
+            raise ValueError('缺少会话标识')
+        with self.lock:
+            lib = self.library
+        if not lib:
+            raise ValueError('请先连接微信。')
+        if lib.get('demo') or not lib.get('account_dir'):
+            raise ValueError('演示模式或备份归档不支持实时同步，请先连接本机微信。')
+        if not self.detect()['running']:
+            raise ValueError('请先打开并登录电脑微信。')
+        with self.lock:
+            if any(t['status'] in ('queued', 'running') for t in self.config['tasks']):
+                raise ValueError('正在执行其他任务（如连接或导出），请等待当前任务完成。')
+
+        from wx4 import key, decrypt
+        from wx4.reader import Wx4Data
+
+        account_dir = Path(lib['account_dir'])
+        db_storage = str(account_dir / 'db_storage')
+        if not os.path.isdir(db_storage):
+            raise ValueError('未找到微信数据库存储目录：%s' % db_storage)
+        root = Path(lib['root'])
+        slot = root.parent
+        keys_file = slot / 'keys.json'
+        if not keys_file.is_file():
+            raise ValueError('未找到解密凭据，请重新连接微信。')
+        credentials = key.load_keys(str(keys_file))
+
+        target_table = Wx4Data.msg_table_for(session_user)
+        matched_msg_rel = None
+        for p in root.rglob("*.db"):
+            base = p.name
+            if re.match(r"^(biz_)?message_(\d+)?\.db$", base, re.IGNORECASE):
+                try:
+                    con = sqlite3.connect(p.resolve().as_uri() + '?mode=ro', uri=True)
+                    try:
+                        cur = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (target_table,))
+                        if cur.fetchone():
+                            matched_msg_rel = str(p.relative_to(root)).replace('\\', '/')
+                            break
+                    finally:
+                        con.close()
+                except sqlite3.Error:
+                    pass
+
+        target_credentials = {}
+        for k, v in credentials.items():
+            norm_k = k.replace('\\', '/')
+            base = os.path.basename(k).lower()
+            if base == 'session.db':
+                target_credentials[k] = v
+            elif matched_msg_rel is not None:
+                if norm_k.lower() == matched_msg_rel.lower():
+                    target_credentials[k] = v
+            else:
+                if re.match(r"^(biz_)?message_(\d+)?\.db$", base, re.IGNORECASE):
+                    target_credentials[k] = v
+
+        if not target_credentials:
+            raise ValueError('未找到匹配的数据库解密凭据，请重新连接微信。')
+
+        tmpdir = tempfile.mkdtemp(prefix="moect_sync_")
+        try:
+            res = decrypt.decrypt_all(target_credentials, db_storage, tmpdir)
+            ok_files = res.get('ok', [])
+            if not ok_files:
+                errors = [err for _, err in res.get('failed', [])]
+                raise ValueError('会话数据同步失败：%s' % (errors[0] if errors else '未能解密最新数据'))
+
+            with self.lock:
+                self._maintenance = True
+            try:
+                deadline = time.time() + 3.0
+                while self._cache_readers > 0 and time.time() < deadline:
+                    time.sleep(0.02)
+                for rel in ok_files:
+                    src_p = Path(tmpdir) / rel
+                    dst_p = root / rel
+                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    for suf in ('-wal', '-shm'):
+                        (dst_p.parent / (dst_p.name + suf)).unlink(missing_ok=True)
+                    shutil.copy2(src_p, dst_p)
+                self._library_epoch += 1
+            finally:
+                with self.lock:
+                    self._maintenance = False
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        updated_session = None
+        try:
+            with self.read_archive() as archive:
+                sessions = archive.sessions()
+                updated_session = next((s for s in sessions if s['username'] == session_user), None)
+        except Exception:
+            pass
+        return {'ok': True, 'session': updated_session, 'username': session_user}
+
+    def global_search(self, payload):
+        query = str((payload or {}).get('query', '')).strip()
+        kind = str((payload or {}).get('kind', 'all')).strip()
+        limit = max(1, min(int((payload or {}).get('limit', 50)), 200))
+        offset = max(0, int((payload or {}).get('offset', 0)))
+        session = (payload or {}).get('session')
+        with self.read_archive() as archive:
+            return archive.global_search(query, kind=kind, limit=limit, offset=offset, session=session)
+
     def qce_preview(self,payload):
         session=(payload.get('peer') or {}).get('peerUid','')
         page=max(1,min(int(payload.get('page',1)),10000000))
         limit=max(1,min(int(payload.get('limit',50)),200))
         flt=payload.get('filter') or {}
-        options={'query':str(flt.get('query',''))[:200],'kind':'all'}
+        kind=str(flt.get('kind') or 'all').strip()
+        options={'query':str(flt.get('query',''))[:200],'kind':kind}
         if flt.get('startTime'):options['start']=int(flt['startTime'])//1000
         if flt.get('endTime'):options['end']=int(flt['endTime'])//1000
         with self.read_archive() as archive:
@@ -547,7 +676,7 @@ class Service:
             result=[]
             for m in rows:
                 rich=dict(m.get('extra',{}))
-                if isinstance(archive, Archive) and m.get('kind') in ('image', 'emoji', 'voice'):
+                if isinstance(archive, Archive) and m.get('kind') in ('image', 'emoji', 'voice', 'video'):
                     rich['media'] = {'session': session, 'shard': m['shard'], 'local_id': m['local_id'],
                                      'server_id': str(m['server_id']), 'kind': m['kind']}
                 if m.get('kind')=='chatrecord' and isinstance(archive,Archive):
@@ -558,6 +687,7 @@ class Service:
                                    senderAvatar=archive.avatars.ui(m['sender_wxid']) if isinstance(archive,Archive) else '',
                                    isSystem=is_system_message(m),
                                    richContent=rich,
+                                   kind=m.get('kind', 'text'),
                                    elements=[{'textElement':{'content':m['text']}}],
                                    peerUin=session,chatType=2 if session.endswith('@chatroom') else 1,
                                    sendType=1 if m['is_sender'] else 0,subMsgType=0,
@@ -646,16 +776,44 @@ class Service:
                         try:
                             archive = self.archive(library)
                             self._check(job)
+                            total_msgs = 0
+                            try:
+                                if hasattr(archive, 'data'):
+                                    table = archive.data.msg_table_for(session['username'])
+                                    for con in archive.data.msg_dbs:
+                                        if table in archive.data.tables_of(con):
+                                            where, args = [], []
+                                            if options.get('start'): where.append('create_time >= ?'); args.append(options['start'])
+                                            if options.get('end'): where.append('create_time <= ?'); args.append(options['end'])
+                                            c_sql = ' WHERE ' + ' AND '.join(where) if where else ''
+                                            total_msgs += con.execute(f'SELECT count(*) FROM "{table}"{c_sql}', args).fetchone()[0]
+                            except Exception:
+                                total_msgs = 0
+
                             def progress(count):
                                 self._check(job)
-                                self._update(job, count=count, detail='正在导出 %s · %s 条' % (session['display'], count))
+                                pct = min(99, int(count / total_msgs * 100)) if total_msgs > 0 else 0
+                                if total_msgs > 0:
+                                    self._update(job, count=count, progress=pct, detail='正在导出 %s · %s / %s 条 (%d%%)' % (session['display'], f"{count:,}", f"{total_msgs:,}", pct))
+                                else:
+                                    self._update(job, count=count, detail='正在导出 %s · %s 条' % (session['display'], f"{count:,}"))
+
+                            def status(message):
+                                self._check(job)
+                                current_pct = job.get('progress', 0)
+                                current_cnt = job.get('count', 0)
+                                if total_msgs > 0 and current_cnt > 0:
+                                    self._update(job, detail='正在导出 %s · %s/%s 条 (%d%%) · %s' % (session['display'], f"{current_cnt:,}", f"{total_msgs:,}", current_pct, message))
+                                else:
+                                    self._update(job, detail=message)
+
                             result = export_session(archive, session, options, staging, self.assets, progress,
-                                                    lambda: self._check(job), status=lambda message: self._update(job, detail=message))
+                                                    lambda: self._check(job), status=status)
                             export_index(staging, [result], demo=job['demo'], theme=options['_theme'])
                             self._check(job)
                             folder_name = export_folder_name(session['display'], session['username']) + ('_演示' if job['demo'] else '')
                             folder, sizes = self._finish_export_files(job, result, staging, output, folder_name, packaging, password, source_bytes)
-                            self._update(job, folder=str(folder), files=[result], count=result['count'],
+                            self._update(job, progress=100, folder=str(folder), files=[result], count=result['count'],
                                          start_time=result.get('start_time'), end_time=result.get('end_time'),
                                          resource_summary=result.get('resource_summary', {}),
                                          size_info=sizes, compressed=bool(packaging.get('zip')), encrypted=bool(packaging.get('encrypt')),
@@ -902,6 +1060,12 @@ class Service:
 
     def settings(self, payload):
         preference=session_sort(payload['session_sort']) if 'session_sort' in payload else None
+        auto_reconnect=payload.get('auto_reconnect_on_startup')
+        if auto_reconnect is not None and not isinstance(auto_reconnect, bool):
+            raise ValueError('自动重连设置无效')
+        reuse_keys=payload.get('reuse_saved_keys')
+        if reuse_keys is not None and not isinstance(reuse_keys, bool):
+            raise ValueError('密钥复用设置无效')
         with self.lock:
             theme=payload.get('theme');accent=payload.get('accent')
             if accent is not None and (not isinstance(accent,str) or accent not in ACCENT_IDS):raise ValueError('主题色不受支持')
@@ -909,6 +1073,8 @@ class Service:
             if theme in ('light','dark'):self.config['theme']=theme
             if accent is not None:self.config['accent']=accent
             if preference is not None:self.config['session_sort']=preference
+            if auto_reconnect is not None:self.config['auto_reconnect_on_startup']=auto_reconnect
+            if reuse_keys is not None:self.config['reuse_saved_keys']=reuse_keys
             try:
                 self.save()
             except BaseException:
@@ -985,6 +1151,8 @@ class Service:
                   'startup_reconnect':self.startup_reconnect, 'reconnect':self.reconnect,'logout':self.logout,
                   'avatar':lambda:self.avatar(payload.get('url')),
                   'sessions':self.sessions, 'messages':lambda:self.messages(payload),
+                  'sync_session':lambda:self.sync_session(payload),
+                  'global_search':lambda:self.global_search(payload),
                   'qce_preview':lambda:self.qce_preview(payload),
                   'preview_media':lambda:self.preview_media(payload),
                   'archive_preferences':lambda:self.archive_preferences(payload),

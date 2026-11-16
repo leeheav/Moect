@@ -15,6 +15,8 @@ import sqlite3
 import struct
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from Cryptodome.Cipher import AES
@@ -192,47 +194,100 @@ def quick_check(db_path: str) -> bool:
 
 
 def decrypt_all(keys: dict[str, dict], db_storage: str, out_dir: str,
-                progress=None, check_retries: int = 3, cancel=None) -> dict:
-    """按 keys.json 的结构批量解密。
+                progress=None, check_retries: int = 3, cancel=None,
+                max_workers: int | None = None) -> dict:
+    """按 keys.json 的结构多线程并行解密。
 
     keys: {相对路径: {"enc_key": hex, "salt": hex}}
     """
     progress = progress or (lambda m: None)
     results = {"ok": [], "failed": [], "skipped": []}
+    if not keys:
+        return results
+
     os.makedirs(out_dir, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix="wx4snap_")
+
+    if max_workers is None:
+        cpu_cnt = os.cpu_count() or 4
+        max_workers = min(8, max(2, cpu_cnt))
+    max_workers = max(1, min(max_workers, len(keys)))
+
+    progress_lock = threading.Lock()
+    completed = 0
+    total = len(keys)
+
+    def decrypt_item(item_index: int, rel: str, info: dict) -> tuple[str, str, any]:
+        if cancel:
+            cancel()
+        src = os.path.join(db_storage, rel)
+        dst = os.path.join(out_dir, rel)
+        if not os.path.exists(src):
+            return ("skipped", rel, "源文件不存在")
+
+        enc_key = bytes.fromhex(info["enc_key"])
+        last_err = None
+        # 每个工作线程在专属临时子目录进行快照，防止同名或并发写冲突
+        worker_tmp = os.path.join(tmpdir, f"t_{item_index}")
+        os.makedirs(worker_tmp, exist_ok=True)
+
+        for attempt in range(1, check_retries + 1):
+            if cancel:
+                cancel()
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+                snap = _snapshot(src, worker_tmp)
+                info2 = decrypt_file(snap, dst, enc_key, cancel=cancel)
+                if quick_check(dst):
+                    return ("ok", rel, info2)
+                last_err = "quick_check 未通过"
+            except DecryptError as e:
+                last_err = str(e)
+                break
+            except OSError as e:
+                last_err = "IO 错误：%s" % e
+            if attempt < check_retries:
+                time.sleep(0.3)
+        return ("failed", rel, last_err or "解密失败")
+
+    def record_result(status: str, rel: str, payload: any):
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            if status == "ok":
+                results["ok"].append(rel)
+                progress("[%d/%d] %s 完成（%d 页, WAL %d 帧）"
+                         % (completed, total, rel, payload["pages"], payload["wal_frames"]))
+            elif status == "skipped":
+                results["skipped"].append((rel, payload))
+                progress("[%d/%d] 跳过 %s（%s）" % (completed, total, rel, payload))
+            else:
+                results["failed"].append((rel, payload))
+                progress("[%d/%d] %s 失败：%s" % (completed, total, rel, payload))
+
     try:
-        for i, (rel, info) in enumerate(sorted(keys.items()), 1):
-            src = os.path.join(db_storage, rel)
-            dst = os.path.join(out_dir, rel)
-            if not os.path.exists(src):
-                results["skipped"].append((rel, "源文件不存在"))
-                progress("[%d/%d] 跳过 %s（源文件不存在）" % (i, len(keys), rel))
-                continue
-            enc_key = bytes.fromhex(info["enc_key"])
-            last_err = None
-            for attempt in range(1, check_retries + 1):
+        if max_workers <= 1:
+            for idx, (rel, info) in enumerate(sorted(keys.items()), 1):
+                status, r, payload = decrypt_item(idx, rel, info)
+                record_result(status, r, payload)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(decrypt_item, idx, rel, info): rel
+                    for idx, (rel, info) in enumerate(sorted(keys.items()), 1)
+                }
                 try:
-                    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
-                    snap = _snapshot(src, tmpdir)
-                    info2 = decrypt_file(snap, dst, enc_key,cancel=cancel)
-                    if quick_check(dst):
-                        results["ok"].append(rel)
-                        progress("[%d/%d] %s  完成（%d 页, WAL %d 帧）"
-                                 % (i, len(keys), rel, info2["pages"], info2["wal_frames"]))
-                        last_err = None
-                        break
-                    last_err = "quick_check 未通过"
-                except DecryptError as e:
-                    last_err = str(e)
-                    break
-                except OSError as e:
-                    last_err = "IO 错误：%s" % e
-                if attempt < check_retries:
-                    time.sleep(0.3)      # 微信可能在写页，等一拍再快照
-            if last_err:
-                results["failed"].append((rel, last_err))
-                progress("[%d/%d] %s 失败：%s" % (i, len(keys), rel, last_err))
+                    for future in as_completed(futures):
+                        status, r, payload = future.result()
+                        record_result(status, r, payload)
+                except BaseException:
+                    for f in futures:
+                        f.cancel()
+                    raise
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    results["ok"].sort()
+    results["failed"].sort(key=lambda x: x[0])
+    results["skipped"].sort(key=lambda x: x[0])
     return results

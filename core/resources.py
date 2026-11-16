@@ -69,6 +69,7 @@ class ResourceStore:
             self.stats={'available':0,'missing':0,'encrypted':0,'unsupported':0,'corrupt':0,'skipped':0}
             self.failed_downloads=set()
             self.download_outcomes={};self.prefer_direct=False
+            self.consecutive_download_failures=0;self.circuit_broken=False
             self.report=handles.enter_context(open(self.out/'resource-report.jsonl','w',encoding='utf-8'))
             self._handles = handles.pop_all()
 
@@ -235,6 +236,7 @@ class ResourceStore:
         return {'kind':category,'path':dest.relative_to(self.out).as_posix(),'name':name,'status':status,'role':role}
 
     def _download(self,url,limit):
+        if self.circuit_broken:return None
         identity=hashlib.sha256(url.encode()).hexdigest()
         if not media_url(url):
             if len(self.download_outcomes)<2048:self.download_outcomes[identity]={'status':'host_not_supported'}
@@ -245,20 +247,19 @@ class ResourceStore:
             cache.mkdir(parents=True,exist_ok=True)
             if path.is_file() and 0<path.stat().st_size<=limit:
                 if len(self.download_outcomes)<2048:self.download_outcomes[identity]={'status':'cached'}
+                self.consecutive_download_failures=0
                 return path
         except OSError:
             if len(self.download_outcomes)<2048:self.download_outcomes[identity]={'status':'cache_unavailable'}
             return None
-        if self.preview:
-            self.download_outcomes[identity]={'status':'not_cached'}
+        if self.preview or self.circuit_broken:
+            self.download_outcomes[identity]={'status':'circuit_broken' if self.circuit_broken else 'not_cached'}
             return None
         class Redirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self,req,fp,code,msg,headers,newurl):
                 if not media_url(newurl):raise ValueError('Invalid media redirect')
                 return super().redirect_request(req,fp,code,msg,headers,newurl)
-        # A broken inherited proxy blocked both emoji downloads on this machine.
-        # Retry the SAME allowlisted resource directly; never alter system proxy
-        # settings or disable TLS verification. Remember a working transport.
+        # Fast-fail for non-responsive CDN links: 1.5s connection timeout, 4.0s deadline
         transports=(True,False) if self.prefer_direct else (False,True)
         errors=[]
         for direct in transports:
@@ -268,8 +269,8 @@ class ResourceStore:
                 if direct:handlers.append(urllib.request.ProxyHandler({}))
                 opener=urllib.request.build_opener(*handlers)
                 req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'*/*'})
-                deadline=time.monotonic()+25
-                with opener.open(req,timeout=4) as response,open(temp,'wb') as stream:
+                deadline=time.monotonic()+4.0
+                with opener.open(req,timeout=1.5) as response,open(temp,'wb') as stream:
                     length=0
                     while True:
                         self.cancel()
@@ -281,21 +282,31 @@ class ResourceStore:
                         stream.write(chunk)
                 if not length:raise ValueError('Empty media response')
                 os.replace(temp,path);self.prefer_direct=direct
+                self.consecutive_download_failures=0
                 if len(self.download_outcomes)<2048:
                     self.download_outcomes[identity]={'status':'downloaded','transport':'direct' if direct else 'configured',
                         'recovered_after_retry':bool(errors)}
                 return path
+            except urllib.error.HTTPError as exc:
+                temp.unlink(missing_ok=True)
+                errors.append({'transport':'direct' if direct else 'configured','reason':'http_'+str(exc.code)})
+                # 401, 403, 404, 410 mean resource is deleted or unauthorized on CDN; retry is futile
+                if exc.code in (401, 403, 404, 410):
+                    break
             except (OSError,ValueError,TimeoutError) as exc:
                 temp.unlink(missing_ok=True)
                 reason=getattr(exc,'reason',exc)
                 category=('tls_error' if isinstance(reason,ssl.SSLCertVerificationError) else
-                    'http_'+str(exc.code) if isinstance(exc,urllib.error.HTTPError) else
+                    'http_'+str(getattr(exc,'code','')) if isinstance(exc,urllib.error.HTTPError) else
                     'timeout' if isinstance(reason,(TimeoutError,)) else 'connection_error')
                 errors.append({'transport':'direct' if direct else 'configured','reason':category})
             finally:
                 temp.unlink(missing_ok=True)
         if len(self.failed_downloads)<2048:self.failed_downloads.add(url)
         if len(self.download_outcomes)<2048:self.download_outcomes[identity]={'status':'download_failed','attempts':errors}
+        self.consecutive_download_failures+=1
+        if self.consecutive_download_failures>=5:
+            self.circuit_broken=True
         return None
 
     def _emoticon_hints(self,msg):
@@ -340,7 +351,7 @@ class ResourceStore:
             if kind in ('image','emoji') and (role=='source_icon' or role=='thumbnail' and any(r['kind']=='image' and r['status']=='available' and r.get('role')=='thumbnail' for r in resources)):
                 continue
             if kind not in ('image','emoji','video','file','link','miniprogram','appmsg','location') or (kind in ('link','miniprogram','appmsg','location') and role not in ('thumbnail','source_icon')):continue
-            if kind=='emoji':self.keys.progress('正在获取表情原文件…')
+            if kind=='emoji' and not self.circuit_broken: self.keys.progress('正在获取表情原文件…')
             source=self._download(hint['url'],128*1024*1024 if kind=='video' and role=='main' else 24*1024*1024)
             result=self.download_outcomes.get(hashlib.sha256(hint['url'].encode()).hexdigest(),{})
             entry={'field':hint.get('field','media'),'host':urlparse(hint['url']).hostname,**result}

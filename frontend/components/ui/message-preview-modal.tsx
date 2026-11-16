@@ -18,11 +18,21 @@ import {
   X,
   ChevronLeft,
   ChevronRight,
+  Copy,
+  Check,
+  FileText,
+  Image as ImageIcon,
+  MessageSquare,
+  Video,
+  FileSpreadsheet,
+  FileArchive,
+  File as FileIcon,
 } from "lucide-react"
 import { format } from "date-fns"
 import { cn } from "@/lib/utils"
 import { nativeFetch as fetch } from "@/src/native"
 import { canLoadNextMessagePage } from "@/lib/message-preview-pagination"
+import { formatBytes } from "@/src/formatBytes"
 
 interface MessagePreviewModalProps {
   open: boolean
@@ -43,6 +53,7 @@ interface Message {
   senderUid: string
   senderUin: string
   senderAvatar?: string
+  kind?: string
   richContent?: any
   isSystem?: boolean
   elements: any[]
@@ -61,6 +72,47 @@ interface MessagePreviewResponse {
   totalPages: number
   hasNext: boolean
   fetchedAt: string
+}
+
+function FileTypeIcon({ filename }: { filename: string }) {
+  const ext = filename.split('.').pop()?.toLowerCase() || ''
+  if (['pdf'].includes(ext)) {
+    return <FileText className="w-8 h-8 text-rose-500 shrink-0" />
+  }
+  if (['doc', 'docx', 'txt', 'md'].includes(ext)) {
+    return <FileText className="w-8 h-8 text-blue-500 shrink-0" />
+  }
+  if (['xls', 'xlsx', 'csv'].includes(ext)) {
+    return <FileSpreadsheet className="w-8 h-8 text-emerald-500 shrink-0" />
+  }
+  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) {
+    return <FileArchive className="w-8 h-8 text-amber-500 shrink-0" />
+  }
+  if (['mp4', 'mov', 'avi', 'mkv', 'flv'].includes(ext)) {
+    return <Video className="w-8 h-8 text-purple-500 shrink-0" />
+  }
+  return <FileIcon className="w-8 h-8 text-muted-foreground shrink-0" />
+}
+
+function CopyFilenameButton({ filename }: { filename: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = () => {
+    navigator.clipboard?.writeText(filename)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={handleCopy}
+      className="rounded-full h-8 px-2.5 text-xs text-muted-foreground hover:text-foreground shrink-0 transition-colors"
+      title="复制文件名"
+    >
+      {copied ? <Check className="w-3.5 h-3.5 text-emerald-500 mr-1" /> : <Copy className="w-3.5 h-3.5 mr-1" />}
+      {copied ? '已复制' : '复制名称'}
+    </Button>
+  )
 }
 
 function marketFaceUrls(emojiId: string): { primary: string, fallback: string } | null {
@@ -90,6 +142,7 @@ function ForwardPreview({record,depth=0}:{record:any,depth?:number}) {
 
 export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePreviewModalProps) {
   const [messages, setMessages] = useState<Message[]>([])
+  const [activeTab, setActiveTab] = useState<'messages' | 'media' | 'files'>('messages')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
@@ -125,16 +178,29 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
     setError(null)
 
     try {
+      const targetKind = filter?.kind !== undefined
+        ? filter.kind
+        : (activeTab === 'media' ? 'media' : (activeTab === 'files' ? 'file' : 'all'))
+
       let finalFilter = currentFilter
       if (!finalFilter) {
-        finalFilter = { startTime: filter?.startTime || 0, endTime: filter?.endTime || Date.now() }
+        finalFilter = {
+          startTime: filter?.startTime || 0,
+          endTime: filter?.endTime || Date.now(),
+          kind: targetKind,
+          query: filter?.query || '',
+        }
         setCurrentFilter(finalFilter)
       } else if (filter) {
         finalFilter = {
           startTime: filter.startTime ?? finalFilter.startTime,
-          endTime: filter.endTime ?? finalFilter.endTime, query: filter.query ?? finalFilter.query
+          endTime: filter.endTime ?? finalFilter.endTime,
+          query: filter.query ?? finalFilter.query,
+          kind: targetKind,
         }
         setCurrentFilter(finalFilter)
+      } else {
+        finalFilter = { ...finalFilter, kind: targetKind }
       }
 
       const response = await fetch('/api/messages/fetch', {
@@ -157,6 +223,15 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleTabSwitch = (newTab: 'messages' | 'media' | 'files') => {
+    setActiveTab(newTab)
+    setCurrentPage(1)
+    const targetKind = newTab === 'media' ? 'media' : (newTab === 'files' ? 'file' : 'all')
+    const filter = { ...(currentFilter || {}), kind: targetKind }
+    setCurrentFilter(filter)
+    fetchMessages(1, filter)
   }
 
   const handleSearch = () => {
@@ -324,6 +399,7 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
 
   useEffect(() => {
     if (open && chat) {
+      setActiveTab('messages')
       setMessages([])
       setCurrentPage(1)
       setTotalPages(1)
@@ -334,7 +410,7 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
       setTimeRangeError(null)
       setError(null)
       setCurrentFilter(null)
-      fetchMessages(1)
+      fetchMessages(1, { kind: 'all' })
     }
   }, [open, chat])
 
@@ -404,9 +480,9 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
         className="fixed inset-x-4 top-14 bottom-4 z-[111] flex flex-col bg-card rounded-2xl shadow-[0_24px_80px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_80px_rgba(0,0,0,0.4)] overflow-hidden"
       >
         {/* Header */}
-        <div className="px-6 py-4 flex items-center justify-between flex-shrink-0">
+        <div className="px-6 py-3.5 flex items-center justify-between flex-shrink-0 border-b border-border/30 gap-4 flex-wrap">
           <div className="flex items-center gap-3">
-            <Avatar className="w-10 h-10 rounded-full">
+            <Avatar className="w-10 h-10 rounded-full shrink-0">
               <AvatarFallback className="bg-muted text-muted-foreground rounded-full">
                 {chat.type === 'group' ? <Users className="w-4 h-4" /> : <User className="w-4 h-4" />}
               </AvatarFallback>
@@ -416,10 +492,51 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
               <p className="text-xs text-muted-foreground">
                 {chat.type === 'group' ? '群聊' : '好友'}
                 <span aria-hidden className="mx-1 inline-block h-3 w-px translate-y-[2px] bg-current opacity-25" />
-                {totalCount.toLocaleString()} 条消息
+                {totalCount.toLocaleString()} 条{activeTab === 'media' ? '多媒体' : (activeTab === 'files' ? '文件' : '消息')}
               </p>
             </div>
           </div>
+
+          {/* Tab Switcher */}
+          <div className="flex items-center gap-1 bg-black/[0.04] dark:bg-white/[0.06] p-1 rounded-full border border-border/20">
+            <button
+              type="button"
+              onClick={() => handleTabSwitch('messages')}
+              className={cn(
+                "px-3 py-1 rounded-full text-xs font-medium transition-all flex items-center gap-1.5",
+                activeTab === 'messages'
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <MessageSquare className="w-3.5 h-3.5" /> 聊天记录
+            </button>
+            <button
+              type="button"
+              onClick={() => handleTabSwitch('media')}
+              className={cn(
+                "px-3 py-1 rounded-full text-xs font-medium transition-all flex items-center gap-1.5",
+                activeTab === 'media'
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <ImageIcon className="w-3.5 h-3.5" /> 图片与视频
+            </button>
+            <button
+              type="button"
+              onClick={() => handleTabSwitch('files')}
+              className={cn(
+                "px-3 py-1 rounded-full text-xs font-medium transition-all flex items-center gap-1.5",
+                activeTab === 'files'
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <FileText className="w-3.5 h-3.5" /> 文件专区
+            </button>
+          </div>
+
           <button
             onClick={onClose}
             className="w-8 h-8 flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] rounded-full transition-colors"
@@ -515,53 +632,131 @@ export function MessagePreviewModal({ open, onClose, chat, onExport }: MessagePr
             )}
 
             {!loading && !error && messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-20">
-                <p className="text-sm text-muted-foreground">{searchQuery ? '没有找到匹配的消息' : '暂无消息'}</p>
+              <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
+                <p className="text-sm">
+                  {searchQuery
+                    ? '没有找到匹配的内容'
+                    : activeTab === 'media'
+                    ? '该会话暂无图片或视频记录'
+                    : activeTab === 'files'
+                    ? '该会话暂无文件记录'
+                    : '暂无消息'}
+                </p>
               </div>
             )}
 
             {!loading && !error && messages.length > 0 && (
-              <div className="space-y-1">
-                {messages.map((msg, idx) => {
-                  if(msg.isSystem)return <div key={`${msg.msgId}-${idx}`} title={format(new Date(msg.msgTime*1000),'yyyy-MM-dd HH:mm:ss')} className="px-6 py-2 text-center text-xs text-muted-foreground/70 whitespace-pre-wrap [overflow-wrap:anywhere]">{formatMessageElements(msg.elements)}</div>
-                  const isFromSelf = msg.sendType === 1
-                  const title = typeof msg.richContent?.title === 'string' ? msg.richContent.title.trim() : ''
-                  const bodyText = msg.elements.map(element => element.textElement?.content || '').join('').trim()
-                  return (
-                    <div
-                      key={`${msg.msgId}-${idx}`}
-                      className={cn(
-                        "flex gap-3 px-4 py-3 rounded-xl transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.02]",
-                        isFromSelf && "bg-black/[0.02] dark:bg-white/[0.02]"
-                      )}
-                    >
-                      <Avatar className="w-8 h-8 flex-shrink-0 rounded-full">
-                        {msg.senderAvatar&&<AvatarImage src={msg.senderAvatar}/>}
-                        <AvatarFallback className="text-xs bg-muted text-muted-foreground rounded-full">
-                          {(msg.sendMemberName || msg.sendNickName || '?')[0]}
-                        </AvatarFallback>
-                      </Avatar>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <span className="text-sm font-medium text-foreground truncate">
-                            {msg.sendMemberName || msg.sendNickName || `用户${msg.senderUin}`}
+              activeTab === 'media' ? (
+                /* Media Gallery Grid */
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 p-1">
+                  {messages.map((msg, idx) => {
+                    const isVideo = msg.kind === 'video' || msg.richContent?.media?.kind === 'video'
+                    return (
+                      <div
+                        key={`${msg.msgId}-${idx}`}
+                        className="group relative rounded-xl overflow-hidden border border-border/40 bg-card flex flex-col transition-all hover:shadow-md hover:border-primary/40"
+                      >
+                        <div className="aspect-square w-full flex items-center justify-center overflow-hidden bg-black/[0.03] dark:bg-white/[0.04] p-1">
+                          {msg.richContent?.media ? (
+                            <LocalMediaPreview hint={msg.richContent.media} />
+                          ) : (
+                            <div className="flex flex-col items-center justify-center text-muted-foreground/60 p-4 text-center">
+                              {isVideo ? <Video className="w-8 h-8 mb-1 text-primary/70" /> : <ImageIcon className="w-8 h-8 mb-1" />}
+                              <span className="text-[11px] truncate max-w-full">
+                                {isVideo ? '视频记录' : '图片'}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="px-2.5 py-1.5 bg-card border-t border-border/30 flex items-center justify-between text-[11px] text-muted-foreground">
+                          <span className="truncate max-w-[90px] font-medium text-foreground/80">
+                            {msg.sendMemberName || msg.sendNickName || '好友'}
                           </span>
-                          <span className="text-xs text-muted-foreground/50">
-                            {format(new Date(msg.msgTime * 1000), 'MM-dd HH:mm')}
+                          <span className="text-[10px] shrink-0 opacity-70">
+                            {format(new Date(msg.msgTime * 1000), 'MM-dd')}
                           </span>
                         </div>
-                        {msg.richContent?.forward?<ForwardPreview record={msg.richContent.forward}/>:<div className="text-sm text-foreground/80 [overflow-wrap:anywhere] leading-relaxed">
-                          {msg.richContent?.media&&<LocalMediaPreview hint={msg.richContent.media}/>}
-                          {(!msg.richContent?.media||!/^\[(?:图片|动画表情|语音.*)\]$/.test(msg.elements[0]?.textElement?.content||''))&&formatMessageElements(msg.elements)}
-                          {title&&title!==bodyText&&<span className="block mt-1 font-medium">{title}</span>}
-                          {msg.richContent?.reply&&<span className="block mt-2 pl-3 border-l-2 border-primary/30 text-xs text-muted-foreground whitespace-pre-wrap [overflow-wrap:anywhere]">{msg.richContent.reply.sender}：<WeChatText text={msg.richContent.reply.text}/></span>}
-                          {msg.richContent?.miniprogram&&<span className="block text-xs text-muted-foreground">小程序 · {msg.richContent.source_name} · {msg.richContent.miniprogram.page_path}</span>}
-                        </div>}
                       </div>
-                    </div>
-                  )
-                })}
-              </div>
+                    )
+                  })}
+                </div>
+              ) : activeTab === 'files' ? (
+                /* File List */
+                <div className="space-y-2">
+                  {messages.map((msg, idx) => {
+                    const filename = msg.richContent?.filename || msg.elements?.[0]?.textElement?.content?.replace(/^\[文件\]\s*/, '') || '未知文件'
+                    const filesize = Number(msg.richContent?.filesize || 0)
+                    return (
+                      <div
+                        key={`${msg.msgId}-${idx}`}
+                        className="flex items-center justify-between gap-3 p-3 rounded-xl border border-border/40 bg-card hover:bg-muted/30 transition-colors"
+                      >
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <FileTypeIcon filename={filename} />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-medium text-foreground truncate" title={filename}>
+                              {filename}
+                            </p>
+                            <div className="flex items-center gap-2 mt-0.5 text-xs text-muted-foreground">
+                              {filesize > 0 && <span>{formatBytes(filesize)}</span>}
+                              <span>·</span>
+                              <span className="truncate max-w-[120px]">
+                                {msg.sendMemberName || msg.sendNickName || '发送者'}
+                              </span>
+                              <span>·</span>
+                              <span>{format(new Date(msg.msgTime * 1000), 'yyyy-MM-dd HH:mm')}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <CopyFilenameButton filename={filename} />
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                /* Chat Messages */
+                <div className="space-y-1">
+                  {messages.map((msg, idx) => {
+                    if(msg.isSystem)return <div key={`${msg.msgId}-${idx}`} title={format(new Date(msg.msgTime*1000),'yyyy-MM-dd HH:mm:ss')} className="px-6 py-2 text-center text-xs text-muted-foreground/70 whitespace-pre-wrap [overflow-wrap:anywhere]">{formatMessageElements(msg.elements)}</div>
+                    const isFromSelf = msg.sendType === 1
+                    const title = typeof msg.richContent?.title === 'string' ? msg.richContent.title.trim() : ''
+                    const bodyText = msg.elements.map(element => element.textElement?.content || '').join('').trim()
+                    return (
+                      <div
+                        key={`${msg.msgId}-${idx}`}
+                        className={cn(
+                          "flex gap-3 px-4 py-3 rounded-xl transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.02]",
+                          isFromSelf && "bg-black/[0.02] dark:bg-white/[0.02]"
+                        )}
+                      >
+                        <Avatar className="w-8 h-8 flex-shrink-0 rounded-full">
+                          {msg.senderAvatar&&<AvatarImage src={msg.senderAvatar}/>}
+                          <AvatarFallback className="text-xs bg-muted text-muted-foreground rounded-full">
+                            {(msg.sendMemberName || msg.sendNickName || '?')[0]}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span className="text-sm font-medium text-foreground truncate">
+                              {msg.sendMemberName || msg.sendNickName || `用户${msg.senderUin}`}
+                            </span>
+                            <span className="text-xs text-muted-foreground/50">
+                              {format(new Date(msg.msgTime * 1000), 'MM-dd HH:mm')}
+                            </span>
+                          </div>
+                          {msg.richContent?.forward?<ForwardPreview record={msg.richContent.forward}/>:<div className="text-sm text-foreground/80 [overflow-wrap:anywhere] leading-relaxed">
+                            {msg.richContent?.media&&<LocalMediaPreview hint={msg.richContent.media}/>}
+                            {(!msg.richContent?.media||!/^\[(?:图片|动画表情|语音.*)\]$/.test(msg.elements[0]?.textElement?.content||''))&&formatMessageElements(msg.elements)}
+                            {title&&title!==bodyText&&<span className="block mt-1 font-medium">{title}</span>}
+                            {msg.richContent?.reply&&<span className="block mt-2 pl-3 border-l-2 border-primary/30 text-xs text-muted-foreground whitespace-pre-wrap [overflow-wrap:anywhere]">{msg.richContent.reply.sender}：<WeChatText text={msg.richContent.reply.text}/></span>}
+                            {msg.richContent?.miniprogram&&<span className="block text-xs text-muted-foreground">小程序 · {msg.richContent.source_name} · {msg.richContent.miniprogram.page_path}</span>}
+                          </div>}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )
             )}
           </div>
         </div>

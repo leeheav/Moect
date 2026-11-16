@@ -17,6 +17,7 @@ import {
   ArrowDownWideNarrow,
   X,
   Filter,
+  RefreshCw,
 } from "lucide-react"
 import { PillDropdown } from "./pill-dropdown"
 import type { CreateTaskForm, Group, Friend } from "@/types/api"
@@ -122,6 +123,9 @@ export interface SessionListProps {
     preset: Pick<CreateTaskForm, "chatType" | "peerUid" | "sessionName"> &
       Partial<Pick<CreateTaskForm, "peerUin" | "historySource">>
   ) => void
+  onSyncSession?: (username: string, sessionName: string) => Promise<void> | void
+  syncingSessionId?: string | null
+  onTriggerGlobalSearch?: (query?: string) => void
 }
 
 
@@ -142,6 +146,9 @@ function SessionListComponent({
   onOpenBatchExportDialog,
   onPreviewChat,
   onOpenTaskWizard,
+  onSyncSession,
+  syncingSessionId,
+  onTriggerGlobalSearch,
 }: SessionListProps) {
   const {
     search,
@@ -352,46 +359,43 @@ function SessionListComponent({
             >
               预览
             </button>
-            {isGroup && group ? (
-              <div className="flex items-center bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] rounded-full overflow-hidden hover:border-black/10 transition-all">
-                <button
-                  className="inline-flex items-center justify-center h-7 pl-3 pr-2 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 hover:text-neutral-900 dark:hover:text-white hover:bg-neutral-50 dark:hover:bg-white/5 transition-colors border-r border-neutral-200/80 dark:border-white/10"
-                  onClick={(e: React.MouseEvent) => {
-                    e.stopPropagation()
-                    onOpenTaskWizard?.({
-                      chatType: 2,
-                      peerUid: item.id,
-                      peerUin: item.id,
-                      sessionName: item.name,
-                    })
-                  }}
-                >
-                  导出
-                </button>
-              </div>
-            ) : (
+            {onSyncSession && (
               <button
-                className="inline-flex items-center justify-center h-7 px-3 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:border-black/10 hover:bg-neutral-50 dark:hover:bg-white/5 hover:text-neutral-900 dark:hover:text-white rounded-full transition-all"
+                disabled={Boolean(syncingSessionId)}
+                title="手动同步该会话最新数据"
+                className="inline-flex items-center justify-center h-7 px-2.5 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:border-black/10 hover:bg-neutral-50 dark:hover:bg-white/5 hover:text-neutral-900 dark:hover:text-white rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 onClick={(e: React.MouseEvent) => {
                   e.stopPropagation()
-                  onOpenTaskWizard?.({
-                    chatType,
-                    peerUid: item.id,
-                    peerUin: isGroup
-                      ? item.id
-                      : String((item.raw as Friend).uin || ""),
-                    sessionName: item.name,
-                  })
+                  onSyncSession(item.id, item.name)
                 }}
               >
-                导出
+                <RefreshCw
+                  className={`w-3.5 h-3.5 mr-1 ${syncingSessionId === item.id ? "animate-spin text-primary" : "text-neutral-500 dark:text-neutral-400"}`}
+                />
+                <span>{syncingSessionId === item.id ? "同步中" : "同步"}</span>
               </button>
             )}
+            <button
+              className="inline-flex items-center justify-center h-7 px-3 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:border-black/10 hover:bg-neutral-50 dark:hover:bg-white/5 hover:text-neutral-900 dark:hover:text-white rounded-full transition-all"
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation()
+                onOpenTaskWizard?.({
+                  chatType: isGroup ? 2 : chatType,
+                  peerUid: item.id,
+                  peerUin: isGroup
+                    ? item.id
+                    : String((item.raw as Friend).uin || ""),
+                  sessionName: item.name,
+                })
+              }}
+            >
+              导出
+            </button>
           </div>
         )}
       </div>
     )
-  }, [batchMode, selectedItems, onToggleItem, onPreviewChat, onOpenTaskWizard, handleRowClick])
+  }, [batchMode, selectedItems, syncingSessionId, onSyncSession, onToggleItem, onPreviewChat, onOpenTaskWizard, handleRowClick])
 
   return (
     <div className="space-y-0">
@@ -416,6 +420,18 @@ function SessionListComponent({
             </button>
           )}
         </div>
+
+        {search.trim() && onTriggerGlobalSearch && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => onTriggerGlobalSearch(search.trim())}
+            className="h-8 text-xs rounded-full px-2.5 text-primary hover:text-primary hover:bg-primary/10 transition-colors shrink-0"
+            title="跨所有会话深度搜索该关键词"
+          >
+            全局搜消息
+          </Button>
+        )}
 
         {/* Filter Controls */}
         <div className="flex items-center gap-2">

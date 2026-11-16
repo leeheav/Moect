@@ -122,6 +122,7 @@ class ResourceTests(unittest.TestCase):
         service.pool.shutdown(wait=True)
         task=service.state()['tasks'][0]
         self.assertEqual(task['title'],'测试群');self.assertEqual(task['format'],'json')
+        self.assertEqual(task['progress'],100)
         path=service.task_file(job);self.assertEqual(path.suffix,'.json')
         service.delete_task(job)
         self.assertTrue(path.is_file());self.assertEqual(service.state()['tasks'],[])
@@ -154,6 +155,24 @@ class ResourceTests(unittest.TestCase):
         svc=Service(ASSETS,self.root/'active-state');job=svc._new_job('export','fixture')
         with self.assertRaises(ValueError):svc.delete_task(job['id'])
         svc.shutdown()
+
+    def test_download_circuit_breaker(self):
+        from core.resources import ResourceStore
+        out=self.root/'res_circuit';out.mkdir()
+        with closing(ResourceStore(self.archive.data,SESSION,out)) as store:
+            self.assertFalse(store.circuit_broken)
+            with patch('urllib.request.build_opener') as mock_opener:
+                mock_inst = mock_opener.return_value
+                mock_inst.open.side_effect = TimeoutError('Simulated network timeout')
+                for i in range(5):
+                    res = store._download(f'https://szextshort.weixin.qq.com/fail_{i}.png', 1024)
+                    self.assertIsNone(res)
+                self.assertTrue(store.circuit_broken)
+                # 6th call should be intercepted by circuit breaker without calling opener.open
+                call_count_before = mock_inst.open.call_count
+                res6 = store._download('https://szextshort.weixin.qq.com/fail_6.png', 1024)
+                self.assertIsNone(res6)
+                self.assertEqual(mock_inst.open.call_count, call_count_before)
 
 
 if __name__=='__main__':unittest.main()

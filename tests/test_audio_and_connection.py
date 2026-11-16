@@ -118,7 +118,7 @@ class ConnectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary=tempfile.TemporaryDirectory();self.root=Path(self.temporary.name)
         self.addCleanup(self.temporary.cleanup)
-        state=self.root/'state';state.mkdir();(state/'config.json').write_text(json.dumps({'app_onboarding_seen':True}),encoding='utf-8')
+        state=self.root/'state';state.mkdir();(state/'config.json').write_text(json.dumps({'app_onboarding_seen':True,'auto_reconnect_on_startup':True}),encoding='utf-8')
         self.service=Service(ASSETS,state)
         self.addCleanup(self.service.shutdown)
         self.account=dict(path=str(self.root/'account'),db_storage=str(self.root/'account/db_storage'),dir_name='wxid_fixture',wxid='wxid_fixture')
@@ -155,7 +155,7 @@ class ConnectionTests(unittest.TestCase):
 
     def test_displaying_tutorial_before_startup_call_still_skips_until_next_process(self):
         folder=self.root/'tutorial-race';folder.mkdir()
-        (folder/'config.json').write_text(json.dumps({'library':{'name':'Synthetic legacy account','account_dir':self.account['path']}}),encoding='utf-8')
+        (folder/'config.json').write_text(json.dumps({'auto_reconnect_on_startup':True,'library':{'name':'Synthetic legacy account','account_dir':self.account['path']}}),encoding='utf-8')
         service=Service(ASSETS,folder)
         try:
             service.call('tutorial_seen',{'kind':'app'})
@@ -213,6 +213,194 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(self.service.state()['tasks'][0]['status'],'cancelled')
         self.assertFalse(list((self.root/'state/archives').rglob('snapshot_*')))
         self.assertTrue(result['job'])
+
+    def test_startup_reconnect_disabled_by_default_and_toggleable(self):
+        folder=self.root/'auto-reconnect-toggle';folder.mkdir()
+        service=Service(ASSETS,folder)
+        try:
+            self.assertFalse(service.config['auto_reconnect_on_startup'])
+            self.assertFalse(service.state()['auto_reconnect_on_startup'])
+            service.library={'name':'fixture','account_dir':self.account['path']}
+            with patch.object(service,'detect',side_effect=AssertionError('Must not detect when disabled')):
+                self.assertEqual(service.startup_reconnect(),{'skipped':True})
+            updated=service.settings({'auto_reconnect_on_startup':True})
+            self.assertTrue(updated['auto_reconnect_on_startup'])
+            self.assertTrue(service.config['auto_reconnect_on_startup'])
+            with self.assertRaises(ValueError):
+                service.settings({'auto_reconnect_on_startup':'invalid'})
+        finally:service.shutdown()
+
+    def test_reuse_saved_keys_setting_and_cached_flow(self):
+        folder=self.root/'reuse-keys-toggle';folder.mkdir()
+        service=Service(ASSETS,folder)
+        try:
+            self.assertTrue(service.config['reuse_saved_keys'])
+            self.assertTrue(service.state()['reuse_saved_keys'])
+            updated=service.settings({'reuse_saved_keys':False})
+            self.assertFalse(updated['reuse_saved_keys'])
+            self.assertFalse(service.config['reuse_saved_keys'])
+            with self.assertRaises(ValueError):
+                service.settings({'reuse_saved_keys':'invalid'})
+        finally:service.shutdown()
+
+    def test_sync_session_validations_and_success_flow(self):
+        folder=self.root/'sync-session-test';folder.mkdir()
+        service=Service(ASSETS,folder)
+        try:
+            # 1. Missing username
+            with self.assertRaisesRegex(ValueError,'缺少会话标识'):
+                service.sync_session({})
+
+            # 2. No library
+            with self.assertRaisesRegex(ValueError,'请先连接微信'):
+                service.sync_session({'username':'friend_wxid_123'})
+
+            # 3. Demo library
+            service.library={'name':'demo','demo':True}
+            with self.assertRaisesRegex(ValueError,'演示模式或备份归档不支持实时同步'):
+                service.sync_session({'username':'friend_wxid_123'})
+
+            # 4. Live library but WeChat not running
+            account_storage=folder/'test_account'
+            (account_storage/'db_storage').mkdir(parents=True)
+            snapshot_dir=folder/'archives/acc1/snapshot_test'
+            snapshot_dir.mkdir(parents=True)
+            keys_file=snapshot_dir.parent/'keys.json'
+            keys_file.write_text(json.dumps({
+                'session.db':{'enc_key':'aabbcc','salt':'1122'},
+                'message_0.db':{'enc_key':'ddeeff','salt':'3344'},
+            }),encoding='utf-8')
+
+            service.library={
+                'name':'live_test',
+                'account_dir':str(account_storage),
+                'root':str(snapshot_dir),
+                'wxid':'wxid_tester'
+            }
+
+            with patch.object(service,'detect',return_value={'running':False,'accounts':[]}):
+                with self.assertRaisesRegex(ValueError,'请先打开并登录电脑微信'):
+                    service.sync_session({'username':'friend_wxid_123'})
+
+            # 5. Live library and WeChat running -> successfully runs decrypt_all and syncs
+            def mock_decrypt(keys,db_storage,out_dir,**kwargs):
+                for k in keys:
+                    p=Path(out_dir)/k
+                    p.parent.mkdir(parents=True,exist_ok=True)
+                    p.write_bytes(b'SQLite format 3\x00' + b'\x00'*4080)
+                return {'ok':list(keys.keys()),'failed':[]}
+
+            with patch.object(service,'detect',return_value={'running':True,'accounts':[]}), \
+                 patch('wx4.decrypt.decrypt_all',side_effect=mock_decrypt), \
+                 patch.object(service,'read_archive') as mock_archive_ctx:
+                mock_archive=unittest.mock.MagicMock()
+                mock_archive.sessions.return_value=[
+                    {'username':'friend_wxid_123','summary':'最新测试消息','last_time':1700000000}
+                ]
+                mock_archive_ctx.return_value.__enter__.return_value=mock_archive
+                mock_archive_ctx.return_value.__exit__.return_value=None
+
+                result=service.sync_session({'username':'friend_wxid_123'})
+                self.assertTrue(result['ok'])
+                self.assertEqual(result['username'],'friend_wxid_123')
+                self.assertEqual(result['session']['summary'],'最新测试消息')
+        finally:service.shutdown()
+
+    def test_parallel_decrypt_all_execution_and_progress(self):
+        from wx4 import decrypt
+        test_dir = self.root / 'parallel-decrypt-test'
+        src_dir = test_dir / 'source'
+        dst_dir = test_dir / 'destination'
+        src_dir.mkdir(parents=True)
+        dst_dir.mkdir(parents=True)
+
+        keys = {}
+        for i in range(8):
+            rel = f'msg/shard_{i}.db'
+            p = src_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b'x' * 4096)
+            keys[rel] = {'enc_key': '0123456789abcdef0123456789abcdef', 'salt': 'aabb'}
+
+        # Add 1 missing file to test skipped
+        keys['missing/ghost.db'] = {'enc_key': '0123456789abcdef0123456789abcdef', 'salt': 'ccdd'}
+
+        progress_calls = []
+        def track_progress(msg):
+            progress_calls.append(msg)
+
+        def mock_decrypt_file(src, dst, key, **kwargs):
+            Path(dst).parent.mkdir(parents=True, exist_ok=True)
+            Path(dst).write_bytes(b'SQLite format 3\x00' + b'\x00' * 4080)
+            return {'pages': 1, 'wal_frames': 0}
+
+        with patch('wx4.decrypt.decrypt_file', side_effect=mock_decrypt_file), \
+             patch('wx4.decrypt.quick_check', return_value=True):
+            res = decrypt.decrypt_all(keys, str(src_dir), str(dst_dir),
+                                      progress=track_progress, max_workers=4)
+
+            self.assertEqual(len(res['ok']), 8)
+            self.assertEqual(len(res['skipped']), 1)
+            self.assertEqual(res['skipped'][0][0], 'missing/ghost.db')
+            self.assertEqual(len(res['failed']), 0)
+            self.assertEqual(len(progress_calls), 9)
+
+            # Check output files exist
+            for i in range(8):
+                self.assertTrue((dst_dir / f'msg/shard_{i}.db').is_file())
+
+    def test_global_search_and_media_filter_in_demo_and_service(self):
+        folder = self.root / 'search-service-test'
+        folder.mkdir()
+        service = Service(ASSETS, folder)
+        try:
+            service.demo()
+            # 1. Search for a keyword present in demo messages
+            res = service.call('global_search', {'query': '日落'})
+            self.assertGreaterEqual(res['total'], 1)
+            self.assertGreaterEqual(res['sessions_hit'], 1)
+            self.assertTrue(any('日落' in item['text'] for item in res['items']))
+            self.assertIn('日落', res['items'][0]['snippet'])
+            self.assertIn('session_groups', res)
+
+            # 2. Search for a non-existing keyword
+            empty_res = service.call('global_search', {'query': '这是一条绝不存在的搜索词xyz999'})
+            self.assertEqual(empty_res['total'], 0)
+            self.assertEqual(len(empty_res['items']), 0)
+
+            # 3. Empty query returns empty
+            zero_res = service.call('global_search', {'query': ''})
+            self.assertEqual(zero_res['total'], 0)
+
+            # 4. Search with kind='media'
+            media_res = service.call('global_search', {'query': '', 'kind': 'media'})
+            self.assertGreaterEqual(media_res['total'], 1)
+            self.assertTrue(all(item['kind'] in ('image', 'video') for item in media_res['items']))
+
+            # 5. Search with kind='file'
+            file_res = service.call('global_search', {'query': '', 'kind': 'file'})
+            self.assertGreaterEqual(file_res['total'], 1)
+            self.assertTrue(all(item['kind'] == 'file' for item in file_res['items']))
+            self.assertIn('filename', file_res['items'][0]['extra'])
+
+            # 6. qce_preview with kind='file' and kind='media'
+            sessions = service.sessions()
+            first_user = sessions[0]['username']
+            prev_file = service.call('qce_preview', {
+                'peer': {'peerUid': first_user},
+                'filter': {'kind': 'file'}
+            })
+            self.assertGreaterEqual(prev_file['totalCount'], 1)
+            self.assertTrue(all(m.get('kind') == 'file' for m in prev_file['messages']))
+
+            prev_media = service.call('qce_preview', {
+                'peer': {'peerUid': first_user},
+                'filter': {'kind': 'media'}
+            })
+            self.assertGreaterEqual(prev_media['totalCount'], 1)
+            self.assertTrue(all(m.get('kind') in ('image', 'video') for m in prev_media['messages']))
+        finally:
+            service.shutdown()
 
 
 if __name__=='__main__':unittest.main()

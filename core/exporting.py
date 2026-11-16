@@ -187,7 +187,7 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                     flush();batch_bytes=0
                 batch.append(record);batch_bytes+=record_bytes;count+=1
                 if len(batch) >= 500:flush();batch_bytes=0
-                if count % 200 == 0: progress(count)
+                if count % 50 == 0: progress(count)
             flush()
             faces.write(out)
             manifest = dict(**meta, count=count, chunks=chunks,
@@ -219,7 +219,7 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                     else:
                         writer.write(f"[{msg['time_str']}] {msg['sender']}\n{text}\n\n")
                     count += 1
-                    if count % 200 == 0: progress(count)
+                    if count % 50 == 0: progress(count)
                 if fmt=='json': writer.write('],"count":'+str(count)+'}')
         cancel()
         progress(count)

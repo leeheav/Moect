@@ -523,6 +523,54 @@ class KeyExtractor:
         return self.keys
 
     # -- 结果保存 / 读取 --------------------------------------------------
+    def load_cached(self, path: str) -> bool:
+        """从已保存的 keys.json 恢复并校验密钥。
+
+        如果当前所有待解密库的 Salt 都在缓存中且校验第一页 HMAC 通过，填充 self.keys 并返回 True。
+        若缺少密钥、文件不存在或校验失败，返回 False。
+        """
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        self.collect()
+        if not self.salt_index:
+            return False
+        cached_keys: dict[str, str] = {}
+        for k, v in data.items():
+            if k.startswith("_") or not isinstance(v, dict):
+                continue
+            enc_key = v.get("enc_key")
+            salt = v.get("salt")
+            if isinstance(enc_key, str) and isinstance(salt, str):
+                cached_keys[salt.lower()] = enc_key.lower()
+        verified: dict[str, str] = {}
+        for salt_hex, items in self.salt_index.items():
+            self.cancel()
+            salt_lower = salt_hex.lower()
+            if salt_lower not in cached_keys:
+                return False
+            key_hex = cached_keys[salt_lower]
+            try:
+                key_bytes = bytes.fromhex(key_hex)
+            except ValueError:
+                return False
+            page1 = items[0]["page1"]
+            if not verify_enc_key(key_bytes, page1):
+                return False
+            verified[salt_hex] = key_hex
+        self.keys = verified
+        self.stats["cached_hit"] = len(self.keys)
+        self.stats["resolved"] = len(self.keys)
+        self.stats["total_salts"] = len(self.salt_index)
+        self.progress("从已保存凭据成功复用并校验了 %d 个数据库密钥" % len(self.keys))
+        return True
+
     def result_payload(self) -> dict:
         out = {
             "_db_storage": self.db_storage,

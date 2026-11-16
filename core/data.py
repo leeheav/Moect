@@ -85,8 +85,12 @@ class Archive:
             if cancel:
                 cancel()
             msg = self.data._build_msg(row, names, session, sort_key[1])
-            if kind != 'all' and msg.get('kind') != kind:
-                continue
+            if kind != 'all':
+                if kind == 'media':
+                    if msg.get('kind') not in ('image', 'video'):
+                        continue
+                elif msg.get('kind') != kind:
+                    continue
             if query and query not in (msg.get('text', '') + ' ' + msg.get('sender', '')).casefold():
                 continue
             msg['_cursor'] = list(sort_key)
@@ -130,6 +134,94 @@ class Archive:
                 result.append(self.data._build_msg(row,names,session,sort_key[1]))
         finally:source.close()
         return result,total
+
+    def global_search(self, query: str, kind: str = 'all', limit: int = 50, offset: int = 0, session: str = None, cancel=None):
+        query = str(query or '').strip()
+        kind = str(kind or 'all').strip()
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        if not query and kind == 'all':
+            return {
+                'items': [],
+                'total': 0,
+                'sessions_hit': 0,
+                'session_groups': [],
+                'query': query,
+                'limit': limit,
+                'offset': offset,
+            }
+
+        all_sessions = self.sessions()
+        session_map = {s['username']: s for s in all_sessions}
+
+        target_sessions = [session] if (session and session in session_map) else [s['username'] for s in all_sessions]
+        target_sessions.sort(key=lambda u: session_map[u].get('sort_time') or session_map[u].get('last_time') or 0, reverse=True)
+
+        matched_items = []
+        session_counts = {}
+        options = {'query': query, 'kind': kind}
+        query_fold = query.casefold()
+
+        for s_user in target_sessions:
+            if cancel:
+                cancel()
+            s_info = session_map[s_user]
+            for msg in self.messages(s_user, options=options, descending=True, cancel=cancel):
+                session_counts[s_user] = session_counts.get(s_user, 0) + 1
+                text = msg.get('text', '')
+                snippet = text
+                if query_fold and query_fold in text.casefold():
+                    idx = text.casefold().find(query_fold)
+                    start_idx = max(0, idx - 30)
+                    end_idx = min(len(text), idx + len(query) + 30)
+                    prefix = '…' if start_idx > 0 else ''
+                    suffix = '…' if end_idx < len(text) else ''
+                    snippet = prefix + text[start_idx:end_idx].strip() + suffix
+                elif len(snippet) > 80:
+                    snippet = snippet[:80] + '…'
+
+                matched_items.append({
+                    'session': s_user,
+                    'session_name': s_info.get('display', s_user),
+                    'session_avatar': s_info.get('avatar_url', ''),
+                    'is_group': s_info.get('is_group', False),
+                    'msg_id': f"{msg.get('shard', 0)}_{msg.get('local_id', 0)}_{msg.get('server_id', '')}",
+                    'local_id': msg.get('local_id', 0),
+                    'server_id': str(msg.get('server_id', '')),
+                    'create_time': msg.get('create_time', 0),
+                    'time_str': msg.get('time_str', ''),
+                    'sender': msg.get('sender', ''),
+                    'sender_wxid': msg.get('sender_wxid', ''),
+                    'avatar_url': msg.get('avatar_url', ''),
+                    'is_sender': msg.get('is_sender', False),
+                    'kind': msg.get('kind', 'text'),
+                    'text': text,
+                    'snippet': snippet,
+                    'extra': msg.get('extra', {}),
+                })
+
+        total = len(matched_items)
+        session_groups = [
+            {
+                'session': u,
+                'display': session_map[u].get('display', u),
+                'avatar_url': session_map[u].get('avatar_url', ''),
+                'is_group': session_map[u].get('is_group', False),
+                'count': cnt,
+            }
+            for u, cnt in session_counts.items()
+        ]
+        session_groups.sort(key=lambda x: x['count'], reverse=True)
+
+        return {
+            'items': matched_items[offset:offset + limit],
+            'total': total,
+            'sessions_hit': len(session_counts),
+            'session_groups': session_groups,
+            'query': query,
+            'limit': limit,
+            'offset': offset,
+        }
 
 
 def validate_root(root):
